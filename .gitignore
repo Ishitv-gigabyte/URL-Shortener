@@ -12,3 +12,9 @@ build/
 .coverage
 **/.DS_Store
 BUGS.md
+
+# Java / Maven
+target/
+.mvn/wrapper/maven-wrapper.jar
+.idea/
+*.iml

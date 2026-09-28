@@ -1,0 +1,13 @@
+server:
+  # Port 8000 matches the FastAPI service, so locustfile.py and the ALB target group work unchanged.
+  port: ${SERVER_PORT:8000}
+
+spring:
+  application:
+    name: url-shortener
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus

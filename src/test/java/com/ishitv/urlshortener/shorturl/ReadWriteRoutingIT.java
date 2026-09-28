@@ -52,6 +52,8 @@ class ReadWriteRoutingIT {
         registry.add("app.datasource.replica.jdbc-url", Containers.POSTGRES_REPLICA::getJdbcUrl);
         registry.add("app.datasource.replica.username", Containers.POSTGRES_REPLICA::getUsername);
         registry.add("app.datasource.replica.password", Containers.POSTGRES_REPLICA::getPassword);
+        registry.add("spring.data.redis.host", Containers.REDIS::getHost);
+        registry.add("spring.data.redis.port", () -> Containers.REDIS.getMappedPort(6379));
     }
 
     @Autowired

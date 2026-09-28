@@ -6,7 +6,7 @@ import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 
 /**
- * Base class for full-application integration tests against real Postgres.
+ * Base class for full-application integration tests against real Postgres and Redis.
  * Primary, replica and flush pools all point at the same container here (like docker compose does), so
  * reads see writes immediately. {@code ReadWriteRoutingIT} overrides the replica with a separate database.
  */
@@ -21,5 +21,7 @@ public abstract class IntegrationTest {
             registry.add("app.datasource." + pool + ".username", Containers.POSTGRES::getUsername);
             registry.add("app.datasource." + pool + ".password", Containers.POSTGRES::getPassword);
         }
+        registry.add("spring.data.redis.host", Containers.REDIS::getHost);
+        registry.add("spring.data.redis.port", () -> Containers.REDIS.getMappedPort(6379));
     }
 }

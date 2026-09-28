@@ -13,6 +13,14 @@ spring:
     hibernate:
       # Flyway owns the schema; Hibernate only checks the entity matches it and fails startup if not.
       ddl-auto: validate
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      # Fail fast. Lettuce's default command timeout is 60s: with Redis down, every request would hang for
+      # a minute instead of falling back to Postgres. 250ms is ~100x a normal Redis round trip.
+      timeout: 250ms
+      connect-timeout: 250ms
   flyway:
     # An existing Python-era database already has the codes table but no flyway_schema_history.
     # Baseline it at version 1 so V1 is recorded as applied instead of failing on "relation exists".
@@ -29,6 +37,16 @@ springdoc:
 app:
   # Prefix of short_url in responses (the Python BASE_URL setting).
   base-url: ${BASE_URL:http://localhost:8000}
+
+  cache:
+    # code:{X} hash (url, created_at, clicks). Same 1h TTL as the Python service, randomised by +/-10% so
+    # entries written together (e.g. during a traffic spike) don't all expire in the same second.
+    url-ttl: 1h
+    ttl-jitter: 0.1
+    # rev:<sha256(url)> -> code, used by POST /shorten to return the existing code for a repeated URL.
+    reverse-ttl: 24h
+    # miss:{X}: remembers "this code does not exist" (and deleted codes, as a tombstone).
+    negative-ttl: 60s
 
   # Pool sizing (per application instance). Traffic is ~80% reads / 20% writes, but most reads are served
   # by Redis, so both web pools are sized the same as the Python engines (pool_size 25 + max_overflow 5).

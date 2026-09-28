@@ -1,19 +1,23 @@
 package com.ishitv.urlshortener.shorturl;
 
 import java.time.Clock;
+import java.util.Optional;
 
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 
+import com.ishitv.urlshortener.cache.CachedUrl;
+import com.ishitv.urlshortener.cache.UrlCache;
 import com.ishitv.urlshortener.error.CodeGenerationException;
 import com.ishitv.urlshortener.error.ShortCodeNotFoundException;
 import com.ishitv.urlshortener.error.UrlTooLongException;
 
 /**
- * Business logic for the four URL operations.
+ * Business logic for the four URL operations, using Redis as a cache-aside layer in front of Postgres.
  *
  * <p>Not {@code @Transactional}: each repository call is its own short transaction, and its read-only
- * flag picks primary vs replica (see {@link ShortCodeRepository}).
+ * flag picks primary vs replica (see {@link ShortCodeRepository}). That also means no database connection
+ * is held while this class talks to Redis.
  */
 @Service
 public class ShortUrlService {
@@ -23,17 +27,90 @@ public class ShortUrlService {
 
     private final ShortCodeRepository repository;
     private final ShortCodeGenerator generator;
+    private final UrlCache cache;
     private final Clock clock;
 
-    public ShortUrlService(ShortCodeRepository repository, ShortCodeGenerator generator, Clock clock) {
+    public ShortUrlService(ShortCodeRepository repository, ShortCodeGenerator generator, UrlCache cache, Clock clock) {
         this.repository = repository;
         this.generator = generator;
+        this.cache = cache;
         this.clock = clock;
     }
 
     public ShortenedUrl shorten(String submittedUrl) {
         String url = normalize(submittedUrl);
 
+        Optional<ShortenedUrl> existing = findRecentlyShortened(url);
+        if (existing.isPresent()) {
+            return existing.get();
+        }
+
+        ShortenedUrl created = insertWithUniqueCode(url);
+        cache.putNew(created.shortCode(), url, created.createdAt());
+        cache.rememberCodeForUrl(url, created.shortCode());
+        return created;
+    }
+
+    /** Returns the original URL to redirect to. */
+    public String resolve(String shortCode) {
+        requireWellFormed(shortCode);
+
+        Optional<String> cached = cache.findUrl(shortCode);
+        if (cached.isPresent()) {
+            return cached.get();
+        }
+        return loadFromReplica(shortCode).getOriginalUrl();
+    }
+
+    public UrlStats stats(String shortCode) {
+        requireWellFormed(shortCode);
+
+        Optional<CachedUrl> cached = cache.find(shortCode);
+        if (cached.isPresent()) {
+            CachedUrl hit = cached.get();
+            return new UrlStats(hit.clicks(), hit.originalUrl(), hit.createdAt());
+        }
+        ShortCode row = loadFromReplica(shortCode);
+        return new UrlStats(row.getClicks(), row.getOriginalUrl(), row.getCreatedAt());
+    }
+
+    public void delete(String shortCode) {
+        requireWellFormed(shortCode);
+
+        // Primary, not replica: deleting something the replica hasn't seen yet must still work, and we need
+        // the URL to remove its reverse-lookup key.
+        ShortCode row = repository.findByShortCodeOnPrimary(shortCode)
+                .orElseThrow(() -> new ShortCodeNotFoundException(shortCode));
+        if (repository.deleteByShortCode(shortCode) == 0) {
+            throw new ShortCodeNotFoundException(shortCode); // a concurrent DELETE won
+        }
+        // Invalidate only after the DELETE has committed. Invalidating first (as the Python service did)
+        // leaves a window where a concurrent cache miss re-reads the still-present row and re-caches it.
+        cache.evict(shortCode, row.getOriginalUrl());
+    }
+
+    /**
+     * The reverse-lookup cache lets a repeated URL return its existing code. It is a best-effort de-dup
+     * (24h TTL), not a uniqueness guarantee: there is no unique index on original_url.
+     */
+    private Optional<ShortenedUrl> findRecentlyShortened(String url) {
+        Optional<String> code = cache.findCodeForUrl(url);
+        if (code.isEmpty()) {
+            return Optional.empty();
+        }
+        Optional<CachedUrl> cached = cache.find(code.get());
+        if (cached.isPresent()) {
+            return Optional.of(new ShortenedUrl(code.get(), url, cached.get().createdAt()));
+        }
+        // The code:{X} entry expired or was evicted while rev: survived. Confirm on the primary, since the
+        // replica may not have the row yet. (The Python service crashed here once; see README history.)
+        return repository.findByShortCodeOnPrimary(code.get()).map(row -> {
+            cache.put(row.getShortCode(), row.getOriginalUrl(), row.getCreatedAt(), row.getClicks());
+            return new ShortenedUrl(row.getShortCode(), url, row.getCreatedAt());
+        });
+    }
+
+    private ShortenedUrl insertWithUniqueCode(String url) {
         for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
             ShortCode candidate = new ShortCode(generator.next(), url, Timestamps.nowUtc(clock));
             try {
@@ -47,21 +124,19 @@ public class ShortUrlService {
         throw new CodeGenerationException(MAX_ATTEMPTS);
     }
 
-    /** Returns the original URL to redirect to. */
-    public String resolve(String shortCode) {
-        return findOnReplica(shortCode).getOriginalUrl();
-    }
-
-    public UrlStats stats(String shortCode) {
-        ShortCode row = findOnReplica(shortCode);
-        return new UrlStats(row.getClicks(), row.getOriginalUrl(), row.getCreatedAt());
-    }
-
-    public void delete(String shortCode) {
-        requireWellFormed(shortCode);
-        if (repository.deleteByShortCode(shortCode) == 0) {
+    /** Cache miss path shared by redirect and stats: negative cache → replica → fill the cache. */
+    private ShortCode loadFromReplica(String shortCode) {
+        if (cache.isKnownMissing(shortCode)) {
             throw new ShortCodeNotFoundException(shortCode);
         }
+        Optional<ShortCode> row = repository.findByShortCode(shortCode);
+        if (row.isEmpty()) {
+            cache.markMissing(shortCode);
+            throw new ShortCodeNotFoundException(shortCode);
+        }
+        ShortCode found = row.get();
+        cache.put(shortCode, found.getOriginalUrl(), found.getCreatedAt(), found.getClicks());
+        return found;
     }
 
     /** Same rule as the Python service: add https:// when no http(s) scheme is present. */
@@ -73,11 +148,6 @@ public class ShortUrlService {
             throw new UrlTooLongException(submittedUrl);
         }
         return url;
-    }
-
-    private ShortCode findOnReplica(String shortCode) {
-        requireWellFormed(shortCode);
-        return repository.findByShortCode(shortCode).orElseThrow(() -> new ShortCodeNotFoundException(shortCode));
     }
 
     private static void requireWellFormed(String shortCode) {

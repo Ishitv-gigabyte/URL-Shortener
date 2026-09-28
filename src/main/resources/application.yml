@@ -48,6 +48,16 @@ app:
     # miss:{X}: remembers "this code does not exist" (and deleted codes, as a tombstone).
     negative-ttl: 60s
 
+  clicks:
+    # How often pending click deltas are moved from Redis into Postgres (fixed delay between runs).
+    flush-interval: 30s
+    # A {clicks}:flushing:* batch older than this was left behind by a crashed flush and is re-applied.
+    orphan-age: 5m
+    # How long applied batch ids are remembered for idempotency.
+    batch-retention: 24h
+    # Tests turn this off and call ClickFlushJob.flushOnce() directly.
+    scheduling-enabled: true
+
   # Pool sizing (per application instance). Traffic is ~80% reads / 20% writes, but most reads are served
   # by Redis, so both web pools are sized the same as the Python engines (pool_size 25 + max_overflow 5).
   # Hikari has no "overflow": maximum-pool-size is the hard cap (25 + 5 = 30), minimum-idle is the warm set.

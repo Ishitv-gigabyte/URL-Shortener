@@ -1,6 +1,9 @@
 # Small pools: several Spring test contexts may be alive at once (each with its own pools), and the
 # Postgres container allows 100 connections. Production sizes would exhaust it.
 app:
+  clicks:
+    # Tests trigger flushes explicitly (ClickFlushJob.flushOnce) so they are deterministic.
+    scheduling-enabled: false
   datasource:
     primary:
       maximum-pool-size: 5

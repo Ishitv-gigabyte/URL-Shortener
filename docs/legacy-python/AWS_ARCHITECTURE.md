@@ -1,10 +1,16 @@
+> **Legacy document.** This describes the previous **Python/FastAPI** implementation as it was deployed
+> during the course (Sections 1–4). The infrastructure below was never defined in code (no Terraform or
+> CloudFormation), and the load-test figures come only from the screenshots in `locust-results/`. They
+> cannot be reproduced from this repository and **do not describe the current Spring Boot service**.
+> The diagram's "Results Callout" (500 users: 403 RPS) also contradicts the tables below (500 users: 687 RPS).
+
 # AWS Architecture
 
 ## Overview
 
 The URL shortener runs on AWS in `eu-west-2` (London) across a horizontally scaled application layer backed by a separated read/write database layer and an in-memory cache.
 
-![Architecture image](docs/ArchitectureImage.png)
+![Architecture image](ArchitectureImage.png)
 
 ## Components
 

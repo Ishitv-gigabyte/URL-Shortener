@@ -1,291 +1,199 @@
 # URL Shortener
 
-![CI](https://github.com/Ishitv-gigabyte/URL-Shortener/actions/workflows/run-ci.yml/badge.svg)
+![CI](https://github.com/Ishitv-gigabyte/URL-Shortener/actions/workflows/java-ci.yml/badge.svg)
 
-A production-oriented URL shortener built as a multi-section course in System Design fundamentals. Each section deliberately introduces a new layer of architectural complexity, starting from a working monolith, then evolving toward a distributed system. This is Section 4.
+A URL shortener built to practise system design: a read/write-split PostgreSQL setup, Redis as a cache and a click buffer, and a scheduled, idempotent batch job that moves click counts into the database.
 
-**Stack:** FastAPI · PostgreSQL · SQLAlchemy · Redis · Docker · GitHub Actions
+**Stack:** Java 21 · Spring Boot 4.1 (Web MVC, Data JPA, Data Redis) · PostgreSQL 15 · Redis 7 · Flyway · HikariCP · Micrometer/Prometheus · JUnit + Testcontainers · Docker · GitHub Actions
+
+The service was first built in Python (FastAPI) and then migrated to Spring Boot with **the same HTTP API**: paths, status codes and JSON bodies are identical, verified against responses recorded from the Python service. The migration plan is in [MIGRATION_PLAN.md](MIGRATION_PLAN.md), and the reasoning behind every design choice is in [docs/decisions/](docs/decisions).
 
 ---
 
-## Section 4 - AWS Deployment & Load Testing
+## Architecture
 
-Section 3 proved the architecture was correct in isolation. Section 4 moves everything to AWS to validate it under realistic conditions - with the load generator on a separate machine, real WAL-based replication, and managed infrastructure.
-
-**Infrastructure**
-
-| Component           | Choice                    | Reason                                                                             |
-| ------------------- | ------------------------- | ---------------------------------------------------------------------------------- |
-| EC2 (×2)            | t3.small                  | Avoids CPU credit exhaustion that caused t3.micro to throttle under sustained load |
-| RDS PostgreSQL (×2) | db.t4g.micro              | Primary for writes, read replica for reads - native WAL streaming replication      |
-| ElastiCache         | Valkey (Redis-compatible) | Managed cache, same API as local Redis                                             |
-| ALB                 | Application Load Balancer | Round-robins traffic across both EC2 instances, health checks on `/health`         |
-
-Each EC2 instance runs a single uvicorn process serving the FastAPI app. Connection pools are sized asymmetrically to match the actual 80/20 read/write traffic split:
-
-```python
-web_engine         = make_engine(DATABASE_URL,     pool_size=25, max_overflow=5)  # writes
-web_replica_engine = make_engine(READ_REPLICA_URL, pool_size=25, max_overflow=5)  # reads
-sync_engine        = make_engine(DATABASE_URL,     pool_size=2,  max_overflow=0)  # background sync
+```
+                   ┌───────────────────────── Spring Boot app (×N) ─────────────────────────┐
+  client ─ HTTP ─▶ │ ShortUrlController → ShortUrlService ─┬─ UrlCache ───────────┐          │
+                   │                                       ├─ ClickCounter ───────┤  Redis   │
+                   │                                       └─ ShortCodeRepository │          │
+                   │                                            │                 │          │
+                   │          readOnly tx ─▶ replica pool (30) ─┤                 │          │
+                   │         read-write tx ─▶ primary pool (30) ┘                 │          │
+                   │  ClickFlushJob (@Scheduled 30s) ─▶ flush pool (2) ─▶ primary │          │
+                   └──────────────────────────────────────────────────────────────┴──────────┘
 ```
 
----
+| Concern | Design | Details |
+| --- | --- | --- |
+| Reads vs writes | `AbstractRoutingDataSource` sends `@Transactional(readOnly = true)` to the replica and everything else to the primary, behind a `LazyConnectionDataSourceProxy` | [02](docs/decisions/02-schema-and-data-access.md) |
+| Redirect cache | Cache-aside. One Redis hash per code (1h TTL ± 10% jitter), negative caching, delete tombstones, falls back to Postgres if Redis fails | [04](docs/decisions/04-redis-cache-aside.md) |
+| Click counting | Redis holds *deltas*, Postgres holds the truth. Every 30s the pending hash is swapped out atomically (`RENAME`) and applied in one `UPDATE`, idempotently | [05](docs/decisions/05-click-counting.md) |
+| Short codes | 10 random base62 characters from `SecureRandom`, retried on unique-constraint collision | [03](docs/decisions/03-core-endpoints.md) |
+| Schema | Flyway migrations. V1 is an exact port of the original schema (verified with `pg_dump` diff) | [02](docs/decisions/02-schema-and-data-access.md) |
 
-## Load Testing
+### Redis keys
 
-Tested with Locust from a local machine against the ALB. Three tests were run at increasing concurrency, with architectural changes applied between them.
+| Key | Type | TTL | Purpose |
+| --- | --- | --- | --- |
+| `code:{X}` | hash `url`, `created_at`, `clicks` | 1h ± 10% | Redirect lookup and stats |
+| `miss:{X}` | string | 60s | "Code doesn't exist" / deleted-code tombstone |
+| `rev:<sha256(url)>` | string → code | 24h | Returns the existing code when the same URL is shortened again |
+| `{clicks}:pending` | hash code → delta | none | Clicks not yet written to Postgres |
+| `{clicks}:flushing:<id>` | hash | none | A batch being written by the flush job |
 
-> **Note on the locustfile:** The 500-user test used a fixed `original_url` for all `/shorten` requests. From the 1000-user test onwards, each request uses a unique `uuid4()` URL, forcing every `/shorten` to go through the full DB write path. The later tests are therefore the more honest stress test.
+### What can be lost, and when
 
----
+| Failure | Clicks lost |
+| --- | --- |
+| App instance crash | At most the click of the request in flight |
+| Crash during a flush | None (the batch is re-applied, exactly once) |
+| Redis crash (AOF `everysec`) | About 1 second |
+| Redis node lost without persistence or replica | Up to one flush interval (30s) |
+| Redis unreachable | Clicks during the outage (redirects keep working; counted in `urlshortener.clicks.dropped`) |
 
-### 500 Concurrent Users
-
-| Endpoint            | Requests    | Failures | Failure Rate | P50       | P95       |
-| ------------------- | ----------- | -------- | ------------ | --------- | --------- |
-| `GET /{code}`       | 231,075     | 22       | 0.010%       | 180ms     | 440ms     |
-| `POST /shorten`     | 65,928      | 9        | 0.014%       | 240ms     | 600ms     |
-| `GET /stats/{code}` | 33,029      | 1        | 0.003%       | 240ms     | 610ms     |
-| **Aggregated**      | **330,032** | **32**   | **0.010%**   | **200ms** | **500ms** |
-
-Peak throughput: **~687 RPS**, stable. Failures per second: **0.07**.
-
-**What the graph shows:** RPS climbs steadily and holds. Response times are well-controlled - p50 at 200ms, p95 at 500ms. All 32 failures are `502 Bad Gateway` ALB responses. This is the optimised system at 500 concurrent users: the connection pools are not under pressure, the cache is absorbing the majority of write lookups, and the system has room to spare.
-
----
-
-### 1000 Concurrent Users - After Adding `/shorten` Cache
-
-**Change applied:** `/shorten` now checks Redis for an existing mapping before hitting the DB. On a cache hit, the write pool is never touched.
-
-| Endpoint            | Requests    | Failures | Failure Rate | P50       | P95         |
-| ------------------- | ----------- | -------- | ------------ | --------- | ----------- |
-| `GET /{code}`       | 237,691     | 26       | 0.011%       | 460ms     | 1,600ms     |
-| `POST /shorten`     | 68,657      | 10       | 0.015%       | 640ms     | 2,300ms     |
-| `GET /stats/{code}` | 33,590      | 3        | 0.009%       | 660ms     | 2,300ms     |
-| **Aggregated**      | **339,938** | **39**   | **0.011%**   | **500ms** | **1,900ms** |
-
-Peak throughput: **~734 RPS**, stable. Failures per second: **0.08**.
-
-**What the graph shows:** RPS climbs to a peak of ~900 during ramp-up then settles into an oscillating band of ~650–900, averaging around 750. The p50 climbs gradually from near-zero to ~800–1000ms as users increase, with mild oscillation appearing in the latter half of the test — the early signs of the pool filling under sustained load. The p95 shows the periodic spike pattern clearly: sharp rises to ~2,000–4,000ms on a roughly 30-second cadence, caused by the background sync job's bulk UPDATE briefly holding row locks on the primary. Failures stay flat at near-zero throughout.
-
-**Why the improvement is so large:** The cache eliminates write pool pressure almost entirely. Under the fixed-URL locustfile, every Locust worker shortens the same URL - after the first request warms the cache, every subsequent `/shorten` is a Redis lookup (~1ms) instead of a DB write (~180ms). The write pool goes from saturated to nearly idle. This test uses unique UUID URLs to confirm the write path holds up even without cache assistance - failure rate stayed at 0.011%.
-
-All 39 failures are `502 Bad Gateway` - occasional ALB blips during ramp-up, not application errors.
-
----
-
-### 2000 Concurrent Users - After Adding `/shorten` Cache
-
-**Change applied:** Fixed a crash in the `/shorten` cache-hit path. Under memory pressure, ElastiCache evicts `created_at:{short_code}` while retaining the `original_url → short_code` mapping (which has a 24-hour TTL keeping it "hot"). The code assumed both keys were always present together and called `datetime.fromisoformat('None')`, crashing with HTTP 500. The fix rehydrates from the DB when `created_at` is missing.
-
-| Endpoint            | Requests    | Failures | Failure Rate | P50       | P95         |
-| ------------------- | ----------- | -------- | ------------ | --------- | ----------- |
-| `GET /{code}`       | 221,879     | 15       | 0.007%       | 330ms     | 4,300ms     |
-| `POST /shorten`     | 64,970      | 11       | 0.017%       | 420ms     | 6,400ms     |
-| `GET /stats/{code}` | 31,736      | 1        | 0.003%       | 430ms     | 6,400ms     |
-| **Aggregated**      | **318,585** | **27**   | **0.008%**   | **360ms** | **5,800ms** |
-
-Peak throughput: **~715 RPS**, stable. Failures per second: **0.06**.
-
-**What the graph shows:** RPS holds at 700–800. Failures stay at zero. But the p50 line develops a sawtooth - oscillating between near-zero and ~3,000ms on a regular cycle. P95 climbs steadily from ~2,000ms to ~7,000ms as the test progresses.
-
-**Why p50 improved while p95 got worse:** At 2,000 users, `created_codes` fills up faster across all Locust workers, meaning more redirect requests hit codes that are already cached. The fast path (Redis, <50ms) accounts for a larger share of total requests - pulling the median down. But the slow path (DB, pool-contended) is much slower because there are twice as many requests competing for the same number of pool connections. This separates the distribution: faster median, much heavier tail.
-
-**Why throughput doesn't scale past ~700–800 RPS:** Doubling users from 1,000 to 2,000 produced no throughput gain - RPS oscillates between ~600 and ~900 rather than climbing, averaging around 715. This is the architectural ceiling of the current setup. The system is bounded by two constraints working together: the total connection pool capacity (60 replica + 64 primary connections across both instances) and the uvicorn thread pool (a single worker per instance dispatches sync handlers to anyio's default thread pool). More concurrent users beyond this point do not add throughput - they lengthen the queue, which is why latency grows while RPS stays bounded. The oscillation within that band corresponds to the same pool fill-and-drain cycle driving the p50 sawtooth: RPS dips when requests are queuing and spikes briefly when the pool clears. The graceful degradation is intentional: requests wait rather than fail.
-
-All 27 failures are `502 Bad Gateway`. Zero HTTP 500s - the bug fix held.
-
----
-
-### Results Summary
-
-| Users | Failure Rate | P50   | P95     | RPS  | Notes                                          |
-| ----- | ------------ | ----- | ------- | ---- | ---------------------------------------------- |
-| 500   | 0.010%       | 200ms | 500ms   | ~687 | Comfortable headroom, pools not under pressure |
-| 1,000 | 0.011%       | 500ms | 1,900ms | ~734 | Approaching ceiling, still stable              |
-| 2,000 | 0.008%       | 360ms | 5,800ms | ~715 | At ceiling - latency climbs, no failures       |
-
-The system's ceiling under the current architecture is ~715 RPS. Scaling past this requires a third EC2 instance, multiple uvicorn workers per instance, or an async DB driver to remove the thread pool constraint.
-
----
-
-### Graph Patterns Explained
-
-Three patterns appear across the graphs that are worth understanding rather than just observing.
-
-**No matter how many users there are, throughput is capped at around 715 req/s**
-
-Adding users beyond around 1,000 doesn't increase throughput - RPS stays flat while latency climbs. This is due to something called Saturation: there's more connections then there are configured by the pool size, and this combined with the uvicorn thread pool (Each EC2 instance runs a single uvicorn worker) causes requests to wait in a queue once all the pool connections are being used. More users, a longer queue, slower processing. The RPS ceiling is where arrival rate matches the service rate - everything above it just adds wait time, increaing the p values.
-
-**Why the orange line (p50) develops a sawtooth at higher concurrency**
-
-At 2,000 users the connection pool slowly fills to capacity, at which point incoming requests queue and wait. Because DB operations take similar amounts of time, connections are released in batches rather than one by one - the pool drains in a burst, and all queued requests get dispatched at once. The majority of those queued requests are redirect cache hits that go straight to Redis and complete in ~1ms, so the median drops to near zero. The pool then fills again, the queue builds, and the cycle repeats. At 1,000 users the pool never fully saturates so the pattern does not appear and the line stays smooth.
-
-**Why the purple line (p95) spikes on a roughly 30-second cadence**
-
-Every 30 seconds the background sync job wakes up, fetches all `clicks:*` keys from Redis, and issues a bulk UPDATE to the primary RDS instance via `sync_engine`. Although `sync_engine` has its own connection pool and does not share connections with the web engines, the UPDATE transaction briefly holds row locks on the `urls` table. Any concurrent `POST /shorten` request that lands during this window is blocked waiting for those locks to release before it can INSERT. This contention lasts only as long as the sync commit takes, typically under a second, but it is enough to push the 95th percentile up sharply before it recovers. The spike cadence matches the 30-second flush interval exactly.
+`/stats` click counts are eventually consistent. The total in Postgres is exact once flushes complete.
 
 ---
 
 ## API
 
-| Method   | Path                  | Status | Description                                                                       |
-| -------- | --------------------- | ------ | --------------------------------------------------------------------------------- |
-| `POST`   | `/shorten`            | 201    | Accepts a long URL, returns a 10-character base62 short code and the original URL |
-| `GET`    | `/{short_code}`       | 302    | Resolves a short code and redirects to the original URL                           |
-| `GET`    | `/stats/{short_code}` | 200    | Returns click count, creation time, and original URL                              |
-| `DELETE` | `/{short_code}`       | 204    | Removes a short code from the database and cache                                  |
-| `GET`    | `/health`             | 200    | Health check                                                                      |
+| Method | Path | Success | Errors |
+| --- | --- | --- | --- |
+| `POST` | `/shorten` | **201** `{"short_url", "created_at", "original_url"}` | **422** Pydantic-style `{"detail": [...]}`; **500** after 10 code collisions |
+| `GET` | `/{short_code}` | **302** with `Location` | **404** `{"detail": "URL not found"}` |
+| `GET` | `/stats/{short_code}` | **200** `{"clicks", "created_at", "original_url"}` | **404** |
+| `DELETE` | `/{short_code}` | **204** | **404** |
+| `GET` | `/health` | **200** `{"status": "ok"}` | Static liveness check for the load balancer |
 
-Interactive docs available at `http://localhost:8000/docs` when running.
-
----
-
-## Running Locally
-
-**Prerequisites:** Docker Desktop, Redis, PostgreSQL
+- Request body: `{"original_url": "<10–1500 chars>"}`. A URL without `http://` or `https://` gets `https://` prepended.
+- `created_at` is UTC, formatted like `2026-09-28T17:10:48.108884`.
+- Swagger UI: `/docs`. OpenAPI spec: `/openapi.json`. Metrics: `/actuator/prometheus`. Dependency health: `/actuator/health`.
 
 ```bash
-# Start Redis
-brew install redis
-brew services start redis
+curl -s -X POST localhost:8000/shorten -H 'content-type: application/json' \
+     -d '{"original_url":"https://example.com/some/long/path"}'
+# {"short_url":"http://localhost:8000/Ab3dE9xYz0","created_at":"2026-09-28T17:10:48.108884","original_url":"https://example.com/some/long/path"}
 
-# Start PostgreSQL (adjust version as needed)
-brew services start postgresql@17
-
-# Start the app
-git clone https://github.com/Ishitv-gigabyte/URL-Shortener.git
-cd URL-Shortener
-docker compose up --build
+curl -si localhost:8000/Ab3dE9xYz0 | grep -i location   # Location: https://example.com/some/long/path
+curl -s  localhost:8000/stats/Ab3dE9xYz0                # {"clicks":1,...}
 ```
 
-This starts two containers:
+---
 
-- `db` - PostgreSQL 15, with a named volume so data persists across restarts
-- `app` - FastAPI on port 8000, waits for the database healthcheck before starting
+## Running locally
 
-Redis and PostgreSQL run on the host machine. Set `READ_REPLICA_URL` in your `.env` to point to a second database for a genuine read/write split.
-
-The app is available at `http://localhost:8000`.
-
-To stop and remove everything (including the database volume):
+**With Docker (recommended).** You need Docker Desktop or Colima.
 
 ```bash
-docker compose down -v
+docker compose up --build        # app on http://localhost:8000
+APP_PORT=18000 docker compose up --build   # if port 8000 is taken
+docker compose down -v           # stop and delete the data volumes
 ```
 
----
+Compose starts `app`, `db` (Postgres 15) and `redis` (Redis 7 with AOF and `volatile-lru`, see [05](docs/decisions/05-click-counting.md)). Only the app's port is published, so it doesn't clash with a Postgres or Redis already running on your machine.
 
-## Running Tests
-
-Tests use SQLite and fakeredis so no external dependencies are needed:
+**Without Docker for the app.** You need JDK 21 plus a running Postgres and Redis.
 
 ```bash
-pip install -r requirements.txt
-pytest tests/
+export DB_PRIMARY_URL=jdbc:postgresql://localhost:5432/urlshortener DB_USERNAME=postgres DB_PASSWORD=postgres
+./mvnw spring-boot:run
 ```
+
+### Configuration
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `DB_PRIMARY_URL` | `jdbc:postgresql://localhost:5432/urlshortener` | Primary (writes, flush job, migrations) |
+| `DB_REPLICA_URL` | = `DB_PRIMARY_URL` | Read replica (redirect/stats cache misses) |
+| `DB_USERNAME` / `DB_PASSWORD` | `postgres` / `postgres` | Both pools. `DB_REPLICA_USERNAME` and `DB_REPLICA_PASSWORD` override them for the replica. |
+| `REDIS_HOST` / `REDIS_PORT` | `localhost` / `6379` | Redis |
+| `BASE_URL` | `http://localhost:8000` | Prefix of `short_url` |
+| `SERVER_PORT` | `8000` | HTTP port |
+
+Pool sizes, TTLs and the flush interval are in [`application.yml`](src/main/resources/application.yml), each with its reasoning.
 
 ---
 
-## CI Pipeline
-
-Four sequential jobs run on every push:
-
-```
-Lint → Check Requirements → Test → Docker
-```
-
-| Job                    | What it does                                                                                                             |
-| ---------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| **Lint**               | Runs `flake8` across `app/` and `tests/`                                                                                 |
-| **Check Requirements** | Runs `pip-compile --dry-run requirements.in` to verify `requirements.txt` is in sync with `requirements.in`              |
-| **Test**               | Spins up Postgres and Redis service containers, runs the full test suite with `pytest`                                   |
-| **Docker**             | Builds the image via `docker compose`, polls `/health` until the app responds, then verifies both containers are running |
-
-Each job only starts if the previous one passes.
-
----
-
-## Local Load Testing (Sections 1–3)
-
-Prior to AWS deployment, the system was load tested locally with Locust using a realistic traffic distribution:
-
-| Endpoint            | Weight | Rationale                           |
-| ------------------- | ------ | ----------------------------------- |
-| `GET /{code}`       | 70%    | Redirects dominate real-world usage |
-| `POST /shorten`     | 20%    | URL creation is less frequent       |
-| `GET /stats/{code}` | 10%    | Analytics traffic                   |
-
-To run the load tests yourself:
+## Tests
 
 ```bash
-pip install locust
-locust -f locustfile.py --host=http://localhost:8000
+./mvnw verify      # unit tests (*Test) + integration tests (*IT); needs Docker for Testcontainers
+./mvnw test        # unit tests only, no Docker
 ```
 
-Then open `http://localhost:8089` to configure and start the test.
+The integration tests start real Postgres and Redis containers:
+- Routing tests use **two separate Postgres containers**, so a read that wrongly goes to the primary fails.
+- `RedisDownIT` points the app at a closed port to prove every endpoint falls back to Postgres.
+- `ErrorContractIT` compares error bodies byte-for-byte with responses recorded from the Python service ([golden file](src/test/resources/golden/python-responses.txt)).
 
-### Results
+**Colima users:** Testcontainers needs two environment variables:
 
-These were the results up until this point with 100 and 500 users.
+```bash
+export DOCKER_HOST=unix://$HOME/.colima/default/docker.sock
+export TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock
+```
 
-**100 concurrent users**
-
-| Metric         | Section 1 | Section 2 | Section 3 | Change (S2→S3)    |
-| -------------- | --------- | --------- | --------- | ----------------- |
-| Throughput     | 108 RPS   | 327.8 RPS | 297.9 RPS | Marginal drop     |
-| Failure rate   | 0%        | 0%        | 0%        | -                 |
-| Median latency | 8ms       | 3ms       | 3ms       | Stable            |
-| POST median    | 8ms       | 40ms      | 5ms       | ✅ 8x faster      |
-| GET p99        | 680ms     | 260ms     | 500ms     | ⚠️ Slightly worse |
-
-**500 concurrent users**
-
-| Metric         | Section 1            | Section 2 | Section 3 | Section 4 (AWS) | Change (S3→S4)            |
-| -------------- | -------------------- | --------- | --------- | --------------- | ------------------------- |
-| Throughput     | 34.5 RPS (collapsed) | ~176 RPS  | ~200 RPS  | ~687 RPS        | ✅ 3.4x higher            |
-| Failure rate   | 97%                  | 2.3%      | 2.2%      | 0.010%          | ✅ Near zero              |
-| Total requests | ~13k                 | ~52k      | ~95k      | ~330k           | ✅ 3.5x more              |
-| Median latency | 7,800ms              | 5ms       | 10ms      | 200ms           | ✅ Honest — no contention |
-
-### Local Test Limitations
-
-The Sections 1–3 results are skewed by local resource contention: Locust and the app ran on the same machine, competing for CPU and memory. The manual 60-second replica sync also caused periodic latency spikes visible in the response time graphs. The artificially low median latencies (3–5ms) reflect localhost networking, not real-world performance.
-
-Section 4 eliminates both issues. Locust runs on a separate machine to the ALB, and RDS Read Replicas use WAL streaming replication, meaning because the replaica receives changes as they come in, there's no collective sync. The AWS results are the accurate baseline.
+CI ([`java-ci.yml`](.github/workflows/java-ci.yml)) runs `./mvnw verify`. It then builds the Compose stack, smoke-tests shorten → redirect → stats → delete, and runs the unchanged `locustfile.py` for 15 seconds as a functional check.
 
 ---
 
-## Design Decisions
+## Load testing
 
-### Why sync over async
+**Throughput and latency: to be re-measured.** The Python service had published Locust results, but they don't apply to this implementation. They are kept, with caveats, in [docs/legacy-python](docs/legacy-python). No numbers are published here until they have been measured in a way someone else can reproduce.
 
-FastAPI runs sync endpoints in a threadpool, so concurrent request handling still works without needing `async def`. The hot path is Redis, and async wouldn't really help there. The database is only hit on cache misses and the 30-second background sync - neither are latency-critical. If the remaining DB calls become a bottleneck later on, using `asyncpg` and `AsyncSession` would be the next step.
+`locustfile.py` is unchanged from the Python version. Traffic mix: 70% redirects, 20% shortens with unique URLs, 10% stats.
 
-### Why three engines
+How to measure:
 
-Each concern gets its own connection pool to prevent one operation from starving another:
-
-```
-web_engine          → request handlers (writes)
-web_replica_engine  → request handlers (reads)
-sync_engine         → Redis → primary flush thread (every 30s)
-```
-
-Section 3 used four engines - the fourth (`sync_replica_engine`) was a background thread that manually synced the local replica and the main engine. On AWS, RDS Read Replicas use WAL streaming and stay in sync automatically, meaning that's now redundant. At scale, all three remaining engines would be replaced with a single connection to PgBouncer or RDS Proxy, which manages real PostgreSQL connections centrally.
-
-### Why Redis for click counting
-
-Every time the database was hit for a redirect, a click was incremented. Under load, this became a bottleneck because requests kept getting queued, and the queue became bigger over time.
-
-Redis increments are stored in memory and are basically instant, which removes writes from the hot path entirely. Clicks are flushed to Postgres in bulk every 30 seconds. The tradeoff: up to 30 seconds of click data could be lost if the app crashes between syncs. This is acceptable for an analytics counter, but not for something like payments.
-
-### Why Pydantic and SQLAlchemy models are separate
-
-Pydantic models (`URLRequest`, `URLResponse`, `StatsResponse`) define what enters and leaves the API - they validate request data and shape responses but are never persisted. SQLAlchemy models (`Code`) map to database tables and handle all persistence. Keeping them separate means validation logic and storage logic don't bleed into each other.
+1. **Run the load generator on a different machine** from the app. On one laptop, Locust and the app compete for CPU, and localhost latency is unrealistically low.
+2. Start the stack: `docker compose up --build -d`. For a realistic test, deploy it with a real read replica and a separate Redis.
+3. Run a fixed, recorded profile headless and export CSVs:
+   ```bash
+   pip install locust
+   locust -f locustfile.py --host http://<app-host>:8000 --headless \
+          -u 500 -r 10 -t 8m --csv results/500u --html results/500u.html
+   ```
+4. Record the git commit, instance types, pool sizes, `-u`/`-r`/`-t`, and Redis/Postgres versions next to the CSVs.
+5. While it runs, watch `/actuator/prometheus`: `http_server_requests_seconds` (p95/p99), `hikaricp_connections_pending`, `urlshortener_cache_lookups_total` (hit rate) and `urlshortener_clicks_flush_seconds`. Those tell you *why* a number is what it is.
+6. Throw away the ramp-up period, and repeat each run at least three times before quoting a result.
 
 ---
+
+## Behaviour changes from the Python service
+
+The external API is unchanged. These internal bugs were fixed, each with a regression test:
+
+| # | Python behaviour | Now |
+| --- | --- | --- |
+| B1 | `/stats` showed `clicks: 0` whenever the Redis counter had expired | DB clicks + pending delta |
+| B2 | A reset Redis counter overwrote the DB total | Redis holds deltas; the DB is only ever added to |
+| B3 | A click racing a delete leaked a key with no TTL | Pending clicks live in one hash, cleared on delete |
+| B4 | `GET /clicks:<code>` redirected to the click count (key collision) | Namespaced keys and code validation → 404 |
+| B5 | A 1500-char URL without a scheme caused a plain-text 500 | 422 validation error |
+| B6 | Redirect and delete returned 500 when Redis was down | Falls back to Postgres |
+| B7 | Any unexpected error stopped click syncing until restart | Supervised `@Scheduled` job |
+| B8 | `KEYS clicks:*` blocked Redis on every sync | Atomic `RENAME` swap, no keyspace scan |
+| B9 | Codes came from a predictable PRNG | `SecureRandom` |
+
+Small framework-level differences (the `Allow` header on 405, `HEAD` support, `/docs` redirecting to the Swagger UI page) are listed in [docs/decisions/03](docs/decisions/03-core-endpoints.md).
+
+---
+
+## Project layout
+
+```
+src/main/java/com/ishitv/urlshortener/
+  shorturl/        entity, repository, service, code generator
+  shorturl/api/    controller, request/response records, Location encoding
+  cache/           UrlCache: every Redis cache key, TTL and Lua script
+  clicks/          ClickCounter, ClickFlushJob, ClickFlushScheduler
+  config/          data sources + routing, typed app properties
+  error/           FastAPI-compatible error responses
+  web/             servlet filters (trailing-slash redirect, body caching)
+src/main/resources/db/migration/   Flyway SQL
+docs/decisions/    one document per migration phase: what, why, alternatives, failure modes, interview questions
+```
 
 ## License
 

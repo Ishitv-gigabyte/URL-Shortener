@@ -5,6 +5,63 @@ server:
 spring:
   application:
     name: url-shortener
+  jpa:
+    # Open-Session-In-View keeps a Hibernate session (and potentially a DB connection) open for the whole
+    # HTTP request, including the Redis calls and JSON rendering. Off: connections are held only inside
+    # repository transactions.
+    open-in-view: false
+    hibernate:
+      # Flyway owns the schema; Hibernate only checks the entity matches it and fails startup if not.
+      ddl-auto: validate
+  flyway:
+    # An existing Python-era database already has the codes table but no flyway_schema_history.
+    # Baseline it at version 1 so V1 is recorded as applied instead of failing on "relation exists".
+    baseline-on-migrate: true
+    baseline-version: 1
+
+app:
+  # Pool sizing (per application instance). Traffic is ~80% reads / 20% writes, but most reads are served
+  # by Redis, so both web pools are sized the same as the Python engines (pool_size 25 + max_overflow 5).
+  # Hikari has no "overflow": maximum-pool-size is the hard cap (25 + 5 = 30), minimum-idle is the warm set.
+  # Budget across 2 instances: primary 2 x (30 + 2) = 64, replica 2 x 30 = 60; RDS db.t4g.micro allows ~87.
+  # connection-timeout = SQLAlchemy pool_timeout (5s): fail fast instead of queueing requests forever.
+  # max-lifetime       = SQLAlchemy pool_recycle (1h). Hikari validates connections on borrow (= pool_pre_ping).
+  datasource:
+    primary:
+      pool-name: primary
+      jdbc-url: ${DB_PRIMARY_URL:jdbc:postgresql://localhost:5432/urlshortener}
+      username: ${DB_USERNAME:postgres}
+      password: ${DB_PASSWORD:postgres}
+      maximum-pool-size: 30
+      minimum-idle: 25
+      connection-timeout: 5000
+      max-lifetime: 3600000
+    replica:
+      pool-name: replica
+      # Defaults to the primary so a single-database setup (docker compose, local dev) works unchanged.
+      jdbc-url: ${DB_REPLICA_URL:${DB_PRIMARY_URL:jdbc:postgresql://localhost:5432/urlshortener}}
+      username: ${DB_REPLICA_USERNAME:${DB_USERNAME:postgres}}
+      password: ${DB_REPLICA_PASSWORD:${DB_PASSWORD:postgres}}
+      # Defence in depth: even if a write were mis-routed here, the connection itself refuses it.
+      # pgjdbc only enforces read-only inside explicit transactions unless readOnlyMode=always.
+      read-only: true
+      data-source-properties:
+        readOnlyMode: always
+      maximum-pool-size: 30
+      minimum-idle: 25
+      connection-timeout: 5000
+      max-lifetime: 3600000
+    flush:
+      # The click flush job runs one transaction every 30s; a separate tiny pool means request traffic
+      # can never starve it, and it can never starve request traffic.
+      pool-name: flush
+      jdbc-url: ${DB_PRIMARY_URL:jdbc:postgresql://localhost:5432/urlshortener}
+      username: ${DB_USERNAME:postgres}
+      password: ${DB_PASSWORD:postgres}
+      maximum-pool-size: 2
+      minimum-idle: 1
+      connection-timeout: 5000
+      max-lifetime: 3600000
 
 management:
   endpoints:

@@ -3,17 +3,16 @@ package com.ishitv.urlshortener;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import org.junit.jupiter.api.Test;
-import org.springframework.boot.test.context.SpringBootTest;
-import org.springframework.boot.test.context.SpringBootTest.WebEnvironment;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.web.client.RestClient;
+
+import com.ishitv.urlshortener.support.IntegrationTest;
 
 /**
  * Boots the full application on a random port and calls it over real HTTP,
  * the same way the ALB and Locust will.
  */
-@SpringBootTest(webEnvironment = WebEnvironment.RANDOM_PORT)
-class ApplicationIT {
+class ApplicationIT extends IntegrationTest {
 
     @LocalServerPort
     private int port;

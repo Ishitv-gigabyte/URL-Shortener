@@ -1,0 +1,156 @@
+# Responses recorded from the Python/FastAPI service (commit c557e94) on 2026-09-28.
+# Captured with curl against docker compose; Date/Server/Content-Length headers removed.
+# The Java contract tests (ShortUrlContractIT) assert against these shapes.
+
+### POST /shorten valid
+HTTP/1.1 201 Created
+content-type: application/json
+
+{"short_url":"http://localhost:8000/IFXnvL6vSm","created_at":"2026-09-28T17:10:48.108884","original_url":"https://example.com/golden"}
+
+
+### POST /shorten without scheme
+HTTP/1.1 201 Created
+content-type: application/json
+
+{"short_url":"http://localhost:8000/ppBRotum4g","created_at":"2026-09-28T17:10:48.122866","original_url":"https://example.com/noscheme"}
+
+
+### POST /shorten empty
+HTTP/1.1 422 Unprocessable Entity
+content-type: application/json
+
+{"detail":[{"type":"string_too_short","loc":["body","original_url"],"msg":"String should have at least 10 characters","input":"","ctx":{"min_length":10}}]}
+
+
+### POST /shorten 1501 chars
+HTTP/1.1 422 Unprocessable Entity
+content-type: application/json
+
+{"detail":[{"type":"string_too_long","loc":["body","original_url"],"msg":"String should have at most 1500 characters","input":"https://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ctx":{"max_length":1500}}]}
+
+
+### POST /shorten number
+HTTP/1.1 422 Unprocessable Entity
+content-type: application/json
+
+{"detail":[{"type":"string_type","loc":["body","original_url"],"msg":"Input should be a valid string","input":1234567890123}]}
+
+
+### POST /shorten null
+HTTP/1.1 422 Unprocessable Entity
+content-type: application/json
+
+{"detail":[{"type":"string_type","loc":["body","original_url"],"msg":"Input should be a valid string","input":null}]}
+
+
+### POST /shorten object
+HTTP/1.1 422 Unprocessable Entity
+content-type: application/json
+
+{"detail":[{"type":"string_type","loc":["body","original_url"],"msg":"Input should be a valid string","input":{"a":1}}]}
+
+
+### POST /shorten missing field
+HTTP/1.1 422 Unprocessable Entity
+content-type: application/json
+
+{"detail":[{"type":"missing","loc":["body","original_url"],"msg":"Field required","input":{"other":"x"}}]}
+
+
+### POST /shorten array body
+HTTP/1.1 422 Unprocessable Entity
+content-type: application/json
+
+{"detail":[{"type":"model_attributes_type","loc":["body"],"msg":"Input should be a valid dictionary or object to extract fields from","input":[1,2]}]}
+
+
+### POST /shorten malformed JSON
+HTTP/1.1 422 Unprocessable Entity
+content-type: application/json
+
+{"detail":[{"type":"json_invalid","loc":["body",17],"msg":"JSON decode error","input":{},"ctx":{"error":"Expecting value"}}]}
+
+
+### POST /shorten no body
+HTTP/1.1 422 Unprocessable Entity
+content-type: application/json
+
+{"detail":[{"type":"missing","loc":["body"],"msg":"Field required","input":null}]}
+
+
+### POST /shorten text/plain
+HTTP/1.1 422 Unprocessable Entity
+content-type: application/json
+
+{"detail":[{"type":"model_attributes_type","loc":["body"],"msg":"Input should be a valid dictionary or object to extract fields from","input":"{\"original_url\":\"https://example.com/plain\"}"}]}
+
+
+### GET unknown path
+HTTP/1.1 404 Not Found
+content-type: application/json
+
+{"detail":"Not Found"}
+
+
+### PUT /shorten
+HTTP/1.1 405 Method Not Allowed
+allow: GET
+content-type: application/json
+
+{"detail":"Method Not Allowed"}
+
+
+### GET /stats/abc/ (trailing slash)
+HTTP/1.1 307 Temporary Redirect
+location: http://localhost:18000/stats/abc
+
+
+
+### GET /{code} unknown
+HTTP/1.1 404 Not Found
+content-type: application/json
+
+{"detail":"URL not found"}
+
+
+### GET /stats/{code} unknown
+HTTP/1.1 404 Not Found
+content-type: application/json
+
+{"detail":"URL not found"}
+
+
+### DELETE /{code} unknown
+HTTP/1.1 404 Not Found
+content-type: application/json
+
+{"detail":"URL not found"}
+
+
+### POST /shorten (url needing encoding)
+{"short_url":"http://localhost:8000/tIT5DBnKRQ","created_at":"2026-09-28T17:11:25.757083","original_url":"https://example.com/a b/ü?q=1&x=<y>#frag|"}
+
+
+### GET /{code} redirect
+HTTP/1.1 302 Found
+location: https://example.com/a%20b/%C3%BC?q=1&x=%3Cy%3E#frag%7C
+
+
+
+### GET /stats/{code}
+HTTP/1.1 200 OK
+content-type: application/json
+
+{"clicks":1,"created_at":"2026-09-28T17:11:25.757083","original_url":"https://example.com/a b/ü?q=1&x=<y>#frag|"}
+
+
+### DELETE /{code}
+HTTP/1.1 204 No Content
+content-type: application/json
+
+
+
+### Pydantic datetime serialization
+{"clicks":1,"created_at":"2026-01-02T03:04:05","original_url":"x"}
+{"clicks":1,"created_at":"2026-01-02T03:04:05.120000","original_url":"x"}

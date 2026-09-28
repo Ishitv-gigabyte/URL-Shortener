@@ -19,7 +19,17 @@ spring:
     baseline-on-migrate: true
     baseline-version: 1
 
+springdoc:
+  # FastAPI served Swagger UI at /docs and the spec at /openapi.json; keep both URLs.
+  swagger-ui:
+    path: /docs
+  api-docs:
+    path: /openapi.json
+
 app:
+  # Prefix of short_url in responses (the Python BASE_URL setting).
+  base-url: ${BASE_URL:http://localhost:8000}
+
   # Pool sizing (per application instance). Traffic is ~80% reads / 20% writes, but most reads are served
   # by Redis, so both web pools are sized the same as the Python engines (pool_size 25 + max_overflow 5).
   # Hikari has no "overflow": maximum-pool-size is the hard cap (25 + 5 = 30), minimum-idle is the warm set.

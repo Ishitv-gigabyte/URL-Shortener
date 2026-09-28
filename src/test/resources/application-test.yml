@@ -9,6 +9,10 @@ app:
       maximum-pool-size: 5
       minimum-idle: 1
     replica:
+      # Same database as the primary unless a test registers a separate replica (SeparateReplica).
+      jdbc-url: ${app.datasource.primary.jdbc-url}
+      username: ${app.datasource.primary.username}
+      password: ${app.datasource.primary.password}
       maximum-pool-size: 5
       minimum-idle: 1
     flush:

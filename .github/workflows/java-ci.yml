@@ -1,0 +1,31 @@
+name: java-ci
+on: [push, pull_request]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    name: mvn verify
+    steps:
+      - name: Check out source repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      # Unit tests (surefire) + integration tests (failsafe). Later phases use Testcontainers,
+      # which needs only the Docker daemon that ubuntu-latest runners already provide.
+      - name: Build and test
+        run: ./mvnw -B verify
+
+      - name: Upload test reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: |
+            target/surefire-reports
+            target/failsafe-reports

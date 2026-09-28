@@ -2,7 +2,7 @@
 
 The service was originally written in Python (FastAPI, SQLAlchemy, redis-py). It was migrated to Spring Boot;
 see [MIGRATION_PLAN.md](../../MIGRATION_PLAN.md) and [docs/decisions](../decisions). The Python source is
-in git history. The last commit containing it is tagged in the migration's final commit message.
+in git history: commit `adeb867` is the last one that contains it (`git checkout adeb867 -- app tests`).
 
 | File | What it is | Caveat |
 | --- | --- | --- |

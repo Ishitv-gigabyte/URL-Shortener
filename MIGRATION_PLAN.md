@@ -1,6 +1,6 @@
 # Migration Plan: FastAPI → Spring Boot
 
-Status: **Approved 2026-09-28.** The owner delegated all decisions. Final choices are in §10, and they override anything earlier in this document that conflicts.
+Status: **Complete (2026-09-28).** All seven phases are done, and the Python implementation was removed after commit `adeb867`. The owner delegated all decisions. Final choices are in §10, and they override anything earlier in this document that conflicts. Per-phase write-ups are in `docs/decisions/`.
 
 Target: Java 21, Maven (wrapper committed), Spring Boot **4.1.1** (the default stable release on start.spring.io as of 2026-09-28).
 

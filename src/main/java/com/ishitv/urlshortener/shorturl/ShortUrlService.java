@@ -8,12 +8,17 @@ import org.springframework.stereotype.Service;
 
 import com.ishitv.urlshortener.cache.CachedUrl;
 import com.ishitv.urlshortener.cache.UrlCache;
+import com.ishitv.urlshortener.clicks.ClickCounter;
 import com.ishitv.urlshortener.error.CodeGenerationException;
 import com.ishitv.urlshortener.error.ShortCodeNotFoundException;
 import com.ishitv.urlshortener.error.UrlTooLongException;
 
 /**
  * Business logic for the four URL operations, using Redis as a cache-aside layer in front of Postgres.
+ *
+ * <p>Click counts: Postgres holds everything flushed so far, {@link ClickCounter} holds deltas not yet
+ * flushed, and the cached {@code code:{X}} hash holds a display total (seeded as DB + pending, then
+ * incremented on every redirect). The display total is eventually consistent; the DB is exact.
  *
  * <p>Not {@code @Transactional}: each repository call is its own short transaction, and its read-only
  * flag picks primary vs replica (see {@link ShortCodeRepository}). That also means no database connection
@@ -28,12 +33,15 @@ public class ShortUrlService {
     private final ShortCodeRepository repository;
     private final ShortCodeGenerator generator;
     private final UrlCache cache;
+    private final ClickCounter clicks;
     private final Clock clock;
 
-    public ShortUrlService(ShortCodeRepository repository, ShortCodeGenerator generator, UrlCache cache, Clock clock) {
+    public ShortUrlService(ShortCodeRepository repository, ShortCodeGenerator generator, UrlCache cache,
+                           ClickCounter clicks, Clock clock) {
         this.repository = repository;
         this.generator = generator;
         this.cache = cache;
+        this.clicks = clicks;
         this.clock = clock;
     }
 
@@ -51,15 +59,20 @@ public class ShortUrlService {
         return created;
     }
 
-    /** Returns the original URL to redirect to. */
+    /** Returns the original URL to redirect to, and counts the click. */
     public String resolve(String shortCode) {
         requireWellFormed(shortCode);
 
-        Optional<String> cached = cache.findUrl(shortCode);
+        Optional<String> cached = cache.findUrlAndCountClick(shortCode);
+        String url;
         if (cached.isPresent()) {
-            return cached.get();
+            url = cached.get();
+        } else {
+            url = loadFromReplica(shortCode).getOriginalUrl(); // re-seeds code:{X}
+            cache.countClick(shortCode);
         }
-        return loadFromReplica(shortCode).getOriginalUrl();
+        clicks.recordClick(shortCode);
+        return url;
     }
 
     public UrlStats stats(String shortCode) {
@@ -71,7 +84,8 @@ public class ShortUrlService {
             return new UrlStats(hit.clicks(), hit.originalUrl(), hit.createdAt());
         }
         ShortCode row = loadFromReplica(shortCode);
-        return new UrlStats(row.getClicks(), row.getOriginalUrl(), row.getCreatedAt());
+        // B1: the Python service returned 0 here whenever the Redis counter was missing.
+        return new UrlStats(totalClicks(row), row.getOriginalUrl(), row.getCreatedAt());
     }
 
     public void delete(String shortCode) {
@@ -87,6 +101,7 @@ public class ShortUrlService {
         // Invalidate only after the DELETE has committed. Invalidating first (as the Python service did)
         // leaves a window where a concurrent cache miss re-reads the still-present row and re-caches it.
         cache.evict(shortCode, row.getOriginalUrl());
+        clicks.forget(shortCode);
     }
 
     /**
@@ -105,7 +120,7 @@ public class ShortUrlService {
         // The code:{X} entry expired or was evicted while rev: survived. Confirm on the primary, since the
         // replica may not have the row yet. (The Python service crashed here once; see README history.)
         return repository.findByShortCodeOnPrimary(code.get()).map(row -> {
-            cache.put(row.getShortCode(), row.getOriginalUrl(), row.getCreatedAt(), row.getClicks());
+            cache.put(row.getShortCode(), row.getOriginalUrl(), row.getCreatedAt(), totalClicks(row));
             return new ShortenedUrl(row.getShortCode(), url, row.getCreatedAt());
         });
     }
@@ -135,8 +150,13 @@ public class ShortUrlService {
             throw new ShortCodeNotFoundException(shortCode);
         }
         ShortCode found = row.get();
-        cache.put(shortCode, found.getOriginalUrl(), found.getCreatedAt(), found.getClicks());
+        cache.put(shortCode, found.getOriginalUrl(), found.getCreatedAt(), totalClicks(found));
         return found;
+    }
+
+    /** Flushed clicks (DB) + clicks still waiting in Redis. */
+    private long totalClicks(ShortCode row) {
+        return row.getClicks() + clicks.pendingClicks(row.getShortCode());
     }
 
     /** Same rule as the Python service: add https:// when no http(s) scheme is present. */

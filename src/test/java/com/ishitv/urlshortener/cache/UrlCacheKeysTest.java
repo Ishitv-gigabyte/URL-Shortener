@@ -30,7 +30,8 @@ class UrlCacheKeysTest {
     @Test
     void ttlIsJitteredWithinTenPercent() {
         AppProperties properties = new AppProperties("http://localhost:8000",
-                new AppProperties.Cache(Duration.ofHours(1), 0.1, Duration.ofDays(1), Duration.ofSeconds(60)));
+                new AppProperties.Cache(Duration.ofHours(1), 0.1, Duration.ofDays(1), Duration.ofSeconds(60)),
+                new AppProperties.Clicks(Duration.ofSeconds(30), Duration.ofMinutes(5), Duration.ofDays(1), false));
         UrlCache cache = new UrlCache(null, properties, new SimpleMeterRegistry());
 
         long min = Long.MAX_VALUE;

@@ -60,6 +60,17 @@ public class UrlCache {
             return 1
             """, Long.class);
 
+    /**
+     * Redirect hot path in one round trip: return the URL and, only if the entry exists, bump its
+     * displayed click count. The existence check matters: a plain HINCRBY on an expired key would create
+     * a hash holding only {clicks: 1} and no TTL (the Python service's counter-reset bug, B2).
+     */
+    private static final RedisScript<String> URL_AND_COUNT_CLICK = RedisScript.of("""
+            local url = redis.call('HGET', KEYS[1], 'url')
+            if url then redis.call('HINCRBY', KEYS[1], 'clicks', 1) end
+            return url
+            """, String.class);
+
     private final StringRedisTemplate redis;
     private final AppProperties.Cache settings;
     private final MeterRegistry metrics;
@@ -72,12 +83,18 @@ public class UrlCache {
 
     // ---- forward lookup: code:{X} ---------------------------------------------------------------
 
-    /** Just the URL, for redirects (one HGET). */
-    public Optional<String> findUrl(String code) {
-        Optional<String> url = safely("findUrl", Optional::empty,
-                () -> Optional.ofNullable((String) redis.opsForHash().get(codeKey(code), "url")));
+    /** For redirects: the URL, with the cached click count incremented atomically if it was a hit. */
+    public Optional<String> findUrlAndCountClick(String code) {
+        Optional<String> url = safely("findUrlAndCountClick", Optional::empty,
+                () -> Optional.ofNullable(redis.execute(URL_AND_COUNT_CLICK, List.of(codeKey(code)))));
         recordLookup(url.isPresent());
         return url;
+    }
+
+    /** After a cache miss has re-seeded the entry: count the current click in it (no-op if absent). */
+    public void countClick(String code) {
+        safely("countClick", Optional::empty,
+                () -> Optional.ofNullable(redis.execute(URL_AND_COUNT_CLICK, List.of(codeKey(code)))));
     }
 
     /** The whole hash, for stats (one HGETALL). */

@@ -1,8 +1,13 @@
+name: url-shortener
+
 services:
   redis:
     image: redis:7
-    ports:
-      - "6379:6379"
+    # appendonly/everysec: a Redis crash loses at most ~1s of un-flushed clicks.
+    # volatile-lru: under memory pressure only keys WITH a TTL (cache entries) are evicted, never the
+    # TTL-less pending click hashes. See docs/decisions/05-click-counting.md.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec",
+              "--maxmemory", "256mb", "--maxmemory-policy", "volatile-lru"]
     volumes:
       - redis-data:/data
     restart: unless-stopped
@@ -11,10 +16,9 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+
   db:
     image: postgres:15
-    ports:
-      - "5432:5432"
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -30,17 +34,27 @@ services:
   app:
     build: .
     ports:
-      - "8000:8000"
+      - "${APP_PORT:-8000}:8000"
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@db:5432/urlshortener
-      READ_REPLICA_URL: postgresql://postgres:postgres@db:5432/urlshortener
+      DB_PRIMARY_URL: jdbc:postgresql://db:5432/urlshortener
+      # Same database locally; point this at a real read replica in production.
+      DB_REPLICA_URL: jdbc:postgresql://db:5432/urlshortener
+      DB_USERNAME: postgres
+      DB_PASSWORD: postgres
       REDIS_HOST: redis
-      BASE_URL: http://localhost:8000
+      BASE_URL: http://localhost:${APP_PORT:-8000}
     depends_on:
       db:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      # The JRE image has no curl; bash's /dev/tcp is enough to speak HTTP/1.0 to /health.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/8000 && printf 'GET /health HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q '\"status\":\"ok\"' <&3"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
 
 volumes:
   postgres_data:

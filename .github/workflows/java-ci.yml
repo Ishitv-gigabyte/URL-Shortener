@@ -29,3 +29,44 @@ jobs:
           path: |
             target/surefire-reports
             target/failsafe-reports
+
+  docker:
+    runs-on: ubuntu-latest
+    name: Docker compose smoke test
+    needs: verify
+    steps:
+      - name: Check out source repository
+        uses: actions/checkout@v4
+
+      - name: Build and start containers
+        run: docker compose up -d --build
+
+      - name: Wait for the app to be healthy
+        run: |
+          for i in $(seq 1 60); do
+            [ "$(docker compose ps app --format '{{.Health}}')" = "healthy" ] && echo "App is up" && exit 0
+            echo "Waiting... ($i/60)"; sleep 2
+          done
+          docker compose logs app; exit 1
+
+      - name: Shorten, redirect, stats, delete
+        run: |
+          set -eu
+          body=$(curl -sf -X POST localhost:8000/shorten -H 'content-type: application/json' \
+                   -d '{"original_url":"https://example.com/ci-smoke"}')
+          echo "$body"
+          code=$(echo "$body" | sed -E 's#.*"short_url":"[^"]*/([A-Za-z0-9]+)".*#\1#')
+          test "$(curl -s -o /dev/null -w '%{http_code}' localhost:8000/$code)" = 302
+          curl -sf localhost:8000/stats/$code | grep -q '"clicks":1'
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE localhost:8000/$code)" = 204
+          test "$(curl -s -o /dev/null -w '%{http_code}' localhost:8000/$code)" = 404
+
+      - name: Run the unchanged locustfile briefly (functional check, no numbers recorded)
+        run: |
+          docker run --rm --network url-shortener_default \
+            -v "$PWD/locustfile.py:/mnt/locustfile.py:ro" locustio/locust \
+            -f /mnt/locustfile.py --headless -u 10 -r 5 -t 15s --host http://app:8000 --exit-code-on-error 1
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

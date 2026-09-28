@@ -1,0 +1,6 @@
+# Only the Maven wrapper, pom.xml and src/ are needed to build the image.
+*
+!mvnw
+!.mvn/wrapper/maven-wrapper.properties
+!pom.xml
+!src/main/

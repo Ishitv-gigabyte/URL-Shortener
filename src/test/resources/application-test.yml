@@ -1,0 +1,13 @@
+# Small pools: several Spring test contexts may be alive at once (each with its own pools), and the
+# Postgres container allows 100 connections. Production sizes would exhaust it.
+app:
+  datasource:
+    primary:
+      maximum-pool-size: 5
+      minimum-idle: 1
+    replica:
+      maximum-pool-size: 5
+      minimum-idle: 1
+    flush:
+      maximum-pool-size: 2
+      minimum-idle: 1
